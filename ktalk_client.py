@@ -13,9 +13,18 @@ from urllib.parse import quote
 import requests
 
 import cnf
-from ad_mapping import get_recipient_profiles_from_ad_mapping, sync_ad_mentions
 
 logger = logging.getLogger("autoalerter")
+
+
+def _load_ad_mapping_helpers() -> tuple[Any, Any] | None:
+    try:
+        from ad_mapping import get_recipient_profiles_from_ad_mapping, sync_ad_mentions
+
+        return get_recipient_profiles_from_ad_mapping, sync_ad_mentions
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Cannot import ad_mapping helpers: %s", exc)
+        return None
 
 
 def _event_message(event: str, text: str) -> str:
@@ -75,6 +84,19 @@ def _bot_api_url(endpoint: str) -> str:
     return f"{base}/_matrix/client/strangler/api/v1/bot/{cnf.ktalkJwtToken}/{endpoint}"
 
 
+def _safe_bot_endpoint(endpoint: str) -> str:
+    base = str(cnf.ktalkBaseURL).rstrip("/")
+    endpoint = endpoint.lstrip("/")
+    return f"{base}/_matrix/client/strangler/api/v1/bot/***/{endpoint}"
+
+
+def _is_mentions_invites_dry_run() -> bool:
+    enabled = bool(getattr(cnf, "ktalkDryRunMentionsInvites", False))
+    if enabled:
+        logger.info("KTalk dry-run mode is enabled for invites and mentions")
+    return enabled
+
+
 def _bot_request(method: str, endpoint: str, **kwargs: Any) -> requests.Response:
     url = _bot_api_url(endpoint)
     logger.debug("KTalk Bot API request method=%s endpoint=%s", method, endpoint)
@@ -118,16 +140,72 @@ def send_invite_to_discussion(room_id: str, thread_id: str, user_id: str) -> boo
         "thread_id": thread_id,
         "user_id": user_id,
     }
-    logger.debug("Sending discussion invite room_id=%s thread_id=%s user_id=%s", room_id, thread_id, user_id)
+    logger.info(
+        "KTalk invite start room_id=%s thread_id=%s user_id=%s",
+        room_id,
+        thread_id,
+        user_id,
+    )
     response = _bot_request("POST", "invite_to_thread", json=payload)
     if not response.ok:
         logger.error(
-            "Kontur Talk invite failed status=%s user_id=%s body=%s",
-            response.status_code,
+            "KTalk invite failed room_id=%s thread_id=%s user_id=%s status=%s body=%s",
+            room_id,
+            thread_id,
             user_id,
+            response.status_code,
             response.text,
         )
         return False
+
+    logger.info(
+        "KTalk invite success room_id=%s thread_id=%s user_id=%s status=%s",
+        room_id,
+        thread_id,
+        user_id,
+        response.status_code,
+    )
+    return True
+
+
+def invite_user_by_bearer(room_id: str, user_id: str) -> bool:
+    token = str(cnf.CONFIG.get("ktalk_bearer_token", "")).strip()
+    if not token:
+        logger.error("KTalk bearer token is empty, cannot invite user")
+        return False
+
+    auth_header = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+    base = str(cnf.ktalkBaseURL).rstrip("/")
+    room_path = quote(room_id, safe="!:")
+    invite_url = f"{base}/_matrix/client/v3/rooms/{room_path}/invite"
+    payload = {
+        "user_id": user_id,
+    }
+    headers = {
+        "authorization": auth_header,
+        "host": str(cnf.CONFIG.get("ktalk_host", "chat.ktalk.ru")).strip(),
+        "talk-host": str(cnf.CONFIG.get("ktalk_talk_host", "")).strip(),
+    }
+
+    logger.info(
+        "KTalk bearer invite start room_id=%s user_id=%s endpoint=%s",
+        room_id,
+        user_id,
+        f"{base}/_matrix/client/v3/rooms/{room_path}/invite",
+    )
+    response = requests.post(invite_url, headers=headers, json=payload, verify=False, timeout=30)
+    response.encoding = "utf-8"
+    if not response.ok:
+        logger.error(
+            "KTalk bearer invite failed room_id=%s user_id=%s status=%s body=%s",
+            room_id,
+            user_id,
+            response.status_code,
+            response.text,
+        )
+        return False
+
+    logger.info("KTalk bearer invite success room_id=%s user_id=%s", room_id, user_id)
     return True
 
 
@@ -214,7 +292,7 @@ def send_to_ktalk_message(
         cnf.ktalkBaseURL,
         discussion_id,
         cnf.ktalkBotUser,
-        _bot_api_url("send_message"),
+        _safe_bot_endpoint("send_message"),
     )
     response = _bot_request("POST", "send_message", json=payload)
     success = response.ok
@@ -274,8 +352,16 @@ def create_discussion(
     if not thread_event_id:
         logger.warning("Failed to send first thread reply for event=1 thread_id=%s", event_id)
 
+    dry_run = _is_mentions_invites_dry_run()
+
     if users:
         normalized_logins = [_normalize_login(user) for user in users if str(user).strip()]
+        mapping_helpers = _load_ad_mapping_helpers()
+        if mapping_helpers is None:
+            logger.warning("AD mapping helpers are unavailable, skip mention mapping users=%s", users)
+            return event_id
+
+        get_recipient_profiles_from_ad_mapping, sync_ad_mentions = mapping_helpers
         sync_ad_mentions(normalized_logins)
         recipient_profiles = get_recipient_profiles_from_ad_mapping(normalized_logins)
         if not recipient_profiles:
@@ -283,7 +369,6 @@ def create_discussion(
             return event_id
 
         room_members = get_room_members(room_id)
-        failed_invites: list[str] = []
 
         for login in normalized_logins:
             profile = recipient_profiles.get(login)
@@ -294,12 +379,86 @@ def create_discussion(
                 continue
 
             mention = mention_candidates[0]
-            if mention not in room_members:
-                if not send_invite_to_discussion(room_id, event_id, mention):
-                    failed_invites.append(mention)
-
+            logger.info("KTalk mention target resolved login=%s mention=%s", login, mention)
             full_name = (profile or {}).get("full_name", "").strip() or _display_name_from_login(login)
             mention_text = f"{full_name} {mention}"
+
+            if dry_run:
+                if mention not in room_members:
+                    debug_invite_text = f"[DEBUG] Нужно пригласить в обсуждение: {full_name} {mention}"
+                    logger.info(
+                        "KTalk dry-run: invite skipped intentionally room_id=%s login=%s mention=%s",
+                        room_id,
+                        login,
+                        mention,
+                    )
+                    debug_invite_event_id = send_to_ktalk_message(
+                        debug_invite_text,
+                        "",
+                        room_id,
+                        event="1",
+                        thread_id=None,
+                        mentions=[],
+                        message_format="plain",
+                        decorate_event=False,
+                    )
+                    if not debug_invite_event_id:
+                        logger.warning(
+                            "KTalk dry-run invite debug message failed room_id=%s login=%s mention=%s",
+                            room_id,
+                            login,
+                            mention,
+                        )
+
+                debug_mention_text = f"[DEBUG] Нужно упомянуть в треде: {full_name} {mention}"
+                logger.info(
+                    "KTalk dry-run: mention sent as plain text without mentions API room_id=%s thread_id=%s login=%s mention=%s",
+                    room_id,
+                    event_id,
+                    login,
+                    mention,
+                )
+                debug_mention_event_id = send_to_ktalk_message(
+                    debug_mention_text,
+                    "",
+                    room_id,
+                    event="1",
+                    thread_id=event_id,
+                    mentions=[],
+                    message_format="plain",
+                    decorate_event=False,
+                )
+                if not debug_mention_event_id:
+                    logger.warning(
+                        "KTalk dry-run mention debug message failed room_id=%s thread_id=%s login=%s mention=%s",
+                        room_id,
+                        event_id,
+                        login,
+                        mention,
+                    )
+                continue
+
+            if mention not in room_members:
+                logger.info(
+                    "User is not in room members, invite via bearer API room_id=%s login=%s mention=%s",
+                    room_id,
+                    login,
+                    mention,
+                )
+                invited = invite_user_by_bearer(room_id, mention)
+                if not invited:
+                    logger.warning("KTalk bearer invite failed room_id=%s login=%s mention=%s", room_id, login, mention)
+                else:
+                    logger.info("KTalk bearer invite success room_id=%s login=%s mention=%s", room_id, login, mention)
+
+            logger.info(
+                "KTalk mention send start room_id=%s thread_id=%s login=%s full_name=%s mention=%s",
+                room_id,
+                event_id,
+                login,
+                full_name,
+                mention,
+            )
             mention_event_id = send_to_ktalk_message(
                 mention_text,
                 "",
@@ -311,10 +470,10 @@ def create_discussion(
                 decorate_event=False,
             )
             if not mention_event_id:
-                logger.warning("Failed to mention user=%s in thread_id=%s", mention, event_id)
+                logger.warning("KTalk mention failed room_id=%s thread_id=%s login=%s mention=%s", room_id, event_id, login, mention)
+            else:
+                logger.info("KTalk mention success room_id=%s thread_id=%s login=%s mention=%s event_id=%s", room_id, event_id, login, mention, mention_event_id)
 
-        if failed_invites:
-            logger.warning("Failed to invite users to discussion: %s", failed_invites)
     return event_id
 
 

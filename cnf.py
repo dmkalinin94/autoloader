@@ -20,7 +20,7 @@ ktalkJwtToken = "<ktalk_bot_jwt_token>"
 ktalkRoomId = "!SWMeGogRrRLJIxnikt:matrix-9.ktalk.ru"
 ktalkUserDomain = "matrix-9.ktalk.ru"
 ktalkRoomMembersURL = "https://chat.ktalk.ru/_matrix/client/strangler/api/v1/bot/{}/get_room_members"
-
+ktalkDryRunMentionsInvites = False
 
 class query:
     selectActivInc = """
