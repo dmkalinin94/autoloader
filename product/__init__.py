@@ -1,0 +1,1 @@
+"""Modular autoalerter product package."""
