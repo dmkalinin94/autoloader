@@ -1,272 +1,135 @@
-# Autoalerter: модульный продукт с ночной антифлап-логикой
+# Autoalerter (модульная версия)
 
-## 1. Назначение
+## Что реализовано
 
-Этот репозиторий содержит **новую модульную реализацию autoalerter**, которая:
+Проект построен на модульной архитектуре `product/*` и поддерживает:
 
-- принимает событие из CLI (в формате, совместимом со старым запуском);
-- ведёт постоянное состояние по `insight_id` в PostgreSQL;
-- интегрируется с Jira (Assets + Incident API);
-- интегрируется с KTalk (создание корневого сообщения, треды, уведомления);
-- реализует ночную антифлап-логику в окне **21:00–09:00**:
-  - если после `event=0` повторный `event=1` приходит в пределах 3 часов,
-    **новые Jira/KTalk сущности не создаются**;
-  - используется предыдущий `jira_issue_key` и предыдущий `ktalk_thread_id`.
+- CLI-совместимость со старым запуском (`--event`, `--insightId`, `--groups`, `--triggerTime`, `--trigName`, `--message`);
+- хранение состояния в PostgreSQL (`alert_state`);
+- аудит решений (`alert_state_audit`) с расширенным контекстом;
+- историю внешних сущностей (`alert_incidents`);
+- интеграции Jira (Assets + создание инцидента + проверка статуса), KTalk (root + thread), AD mapping;
+- ночную антифлап-логику 21:00–09:00 с переиспользованием thread/issue в пределах `FLAP_REOPEN_HOURS`.
 
----
-
-## 2. Ключевые принципы архитектуры
-
-### 2.1 Разделение ответственности
-
-- `clients/*` — низкоуровневые интеграции (HTTP/LDAP).
-- `services/*` — бизнес-логика и orchestration.
-- `db/queries.py` — SQL-константы (только SQL).
-- `db/repository.py` — доступ к PostgreSQL.
-- `models/*` — dataclass-модели событий и состояния.
-- `utils/*` — вспомогательные функции (время, валидация).
-- `cnf.py` — только конфигурация и константы.
-
-### 2.2 Совместимость с прежним CLI
-
-Запуск поддерживает прежние аргументы:
-
-- `--event`
-- `--insightId`
-- `--groups`
-- `--triggerTime`
-- `--trigName`
-- `--message`
-
-Корневой `main.py` оставлен как совместимый entrypoint.
-
-### 2.3 Отсутствие `.env`
-
-Все настройки хранятся в Python-конфиге `product/cnf.py`.
-
----
-
-## 3. Структура проекта
+## Структура
 
 ```text
 product/
-  __init__.py
-  main.py
   cnf.py
   logging_setup.py
-  models/
-    __init__.py
-    events.py
-    state.py
+  main.py
+  clients/
+    jira_client.py
+    ktalk_client.py
+    ad_mapping_client.py
+  services/
+    event_processor.py
+    jira_service.py
+    ktalk_service.py
+    recipient_service.py
+    state_service.py
+    flap_policy.py
   db/
-    __init__.py
     connection.py
     queries.py
     repository.py
     schema.py
-  services/
-    __init__.py
-    event_processor.py
-    state_service.py
-    flap_policy.py
-    jira_service.py
-    ktalk_service.py
-    recipient_service.py
-  clients/
-    __init__.py
-    jira_client.py
-    ktalk_client.py
-    ldap_client.py
+  models/
+    events.py
+    state.py
   utils/
-    __init__.py
-    time_utils.py
     validators.py
+    time_utils.py
 main.py
-README.md
 ```
 
----
+## Логика жизненного цикла
 
-## 4. Поток обработки события
+### `event=1`
 
-## 4.1 Общий pipeline
+1. Ищется `active` state по `insight_id`.
+2. Если найден:
+   - `event_balance` увеличивается;
+   - сообщение пишется в существующий thread;
+   - аудит: `append_to_active_incident`.
+3. Если не найден:
+   - берется `last_state`;
+   - если ночь и `now <= flap_reopen_until`, выполняется reuse:
+     - state переводится в `active`;
+     - новые Jira/KTalk сущности не создаются;
+     - сообщение пишется в старый thread;
+     - аудит: `reopen_existing_night_incident`.
+4. Иначе создаются новые сущности:
+   - Jira incident;
+   - KTalk root message + first thread reply;
+   - запись в `alert_state`;
+   - запись в `alert_incidents`;
+   - аудит: `open_new_incident` или `night_cooldown_expired_open_new`.
 
-1. `main.py` вызывает `product.main.main()`.
-2. `EventProcessor.run_from_cli()` парсит аргументы.
-3. Параметры преобразуются в `EventPayload`, затем в `ParsedEvent`.
-4. Валидация `insight_id` и разбор времени (`triggerTime`) в timezone-aware datetime.
-5. В зависимости от `event` вызывается:
-   - `_handle_event_open()` для `event=1`;
-   - `_handle_event_close()` для `event=0`.
+### `event=0`
 
-### 4.2 Логика для `event=1`
-
-1. Проверяется активное состояние по `insight_id`.
-2. Если активное состояние уже есть:
-   - увеличивается `event_balance`;
-   - отправляется сообщение в существующий KTalk thread;
-   - пишется аудит (`active_increment`).
-3. Если активного состояния нет:
-   - берётся последнее состояние (`get_last_state`);
-   - проверяется, ночь ли сейчас (21:00–09:00);
-   - проверяется условие reuse (`now <= flap_reopen_until`).
-4. Если выполняется ночной reuse:
-   - состояние реактивируется;
-   - **новый Jira issue не создаётся**;
-   - **новый KTalk thread не создаётся**;
-   - сообщение отправляется в предыдущий тред;
-   - пишется аудит (`night_reuse`).
-5. Если reuse не подходит:
-   - читаются данные сервиса из Jira Assets;
-   - при актуальности сервиса создаются:
-     - новый Jira Incident,
-     - новый KTalk thread,
-     - новая запись состояния в БД;
-   - пишется аудит (`create_new`).
-
-### 4.3 Логика для `event=0`
-
-1. Ищется активное состояние.
-2. Если активного состояния нет:
-   - событие безопасно игнорируется;
-   - пишется аудит (`ignore_close_no_active`).
-3. Если активное состояние есть:
-   - уменьшается `event_balance`;
+1. Если активного state нет:
+   - событие игнорируется безопасно;
+   - аудит: `close_event_ignored_no_state`.
+2. Если активный state есть:
+   - `event_balance` уменьшается;
    - обновляются `last_event0_at` и `flap_reopen_until`;
-   - отправляется сообщение в текущий thread.
-4. Если после уменьшения `event_balance > 0`:
-   - состояние остаётся активным;
-   - аудит (`decrease_only`).
-5. Если `event_balance == 0`:
-   - состояние помечается как `closed`;
-   - Jira key и thread id в записи сохраняются (для возможного ночного reuse);
-   - аудит (`close_state`).
+   - сообщение отправляется в thread.
+3. Если баланс > 0:
+   - аудит: `close_event_decrement_only`.
+4. Если баланс == 0:
+   - **ночью** state переводится в `cooldown_night`, аудит `night_cooldown_started`;
+   - **днем** state переводится в `closed`, история инцидента закрывается, аудит `close_final_daytime`.
 
----
+## Ночная антифлап-логика
 
-## 5. Ночная антифлап-логика (21:00–09:00)
+- Окно ночи определяется как `hour >= 21 OR hour < 9`.
+- На `event=0` вычисляется `flap_reopen_until = event_time + FLAP_REOPEN_HOURS` (в Python, без hardcode в SQL).
+- При повторном `event=1` ночью до `flap_reopen_until` открытие идет в существующие `jira_issue_key` и `ktalk_thread_id`.
 
-## 5.1 Зачем нужна
+## Jira
 
-При флапах ночью (`1 → 0 → 1`) не нужно плодить инциденты и новые обсуждения, если повторное открытие произошло вскоре после закрытия.
+`services/jira_service.py` реализует разбор Assets-атрибутов по `objectTypeAttributeId`:
 
-### 5.2 Условия reuse
+- `63` → `full_name`
+- `126` → `is_actual`
+- `2066` → function refs
+- `2551` → group id
+- `2413` → incident type key
 
-Reuse старого контекста (issue/thread) выполняется, когда одновременно соблюдены условия:
+Отдельно извлекаются recipients из атрибутов группы (`2543`, `2542`) + mandatory recipients.
 
-- текущее событие попадает в ночное окно `21:00–09:00`;
-- активного состояния сейчас нет;
-- существует предыдущее состояние по `insight_id`;
-- у предыдущего состояния есть `last_event0_at`;
-- у предыдущего состояния есть `flap_reopen_until`;
-- текущее время `<= flap_reopen_until`.
+## KTalk
 
-### 5.3 Как считается окно
+`services/ktalk_service.py` использует `clients/ktalk_client.py` и поддерживает:
 
-- ночное окно проверяется через правило: `hour >= 21 OR hour < 9`;
-- `flap_reopen_until` выставляется в БД на этапе `event=0` как `event_time + interval '3 hours'`.
+- root сообщение как старт обсуждения;
+- первый ответ в thread сразу после root;
+- отправку сообщений в thread;
+- mentions списком;
+- нормализацию mention id;
+- проверку room members перед invite;
+- `KTALK_DRY_RUN_MENTIONS_INVITES`.
 
-### 5.4 Что происходит при reuse
+## AD mapping
 
-- выполняется `ACTIVATE_EXISTING_STATE`;
-- сообщение отправляется в существующий `ktalk_thread_id`;
-- используются прежние `jira_issue_key` и thread;
-- новые внешние сущности **не создаются**.
+`clients/ad_mapping_client.py` реализует:
 
----
+- нормализацию логинов;
+- чтение профилей получателей из `ad_ktalk_user_map`;
+- upsert mapping-записей;
+- выдачу `mention_id/full_name` для `RecipientService`.
 
-## 6. Конфигурация (`product/cnf.py`)
+## База данных
 
-В конфиге находятся:
+DDL в `product/db/schema.py`:
 
-- параметры подключения к PostgreSQL;
-- Jira URL и токены;
-- KTalk URL, токен, room-id и поведение dry-run;
-- таймауты и SSL-флаг;
-- путь к лог-файлу;
-- параметры антифлап-логики:
-  - `FLAP_NIGHT_START_HOUR = 21`
-  - `FLAP_NIGHT_END_HOUR = 9`
-  - `FLAP_REOPEN_HOURS = 3`
-  - `TIMEZONE_NAME = "Europe/Moscow"`
+- `availconf.alert_state`
+- `availconf.alert_state_audit` (decision_code, jira_issue_key, ktalk_thread_id, payload_json)
+- `availconf.alert_incidents`
+- `availconf.ad_ktalk_user_map`
 
-> Рекомендуется вынести секреты в защищённый способ доставки конфигурации на уровне runtime/CI/CD, но интерфейс модуля `cnf.py` оставить прежним.
-
----
-
-## 7. Работа с PostgreSQL
-
-## 7.1 Где лежит SQL
-
-Все SQL-запросы находятся в `product/db/queries.py`.
-
-### 7.2 Где лежит доступ к БД
-
-`product/db/repository.py` реализует методы:
-
-- `get_active_state`
-- `get_last_state`
-- `create_state`
-- `activate_existing_state`
-- `decrease_event_balance`
-- `mark_state_closed`
-- `append_audit_event`
-
-### 7.3 Схема таблиц
-
-DDL расположен в `product/db/schema.py`:
-
-- `trmetrics.availconf.alert_state` — текущее/последнее состояние по алерту;
-- `trmetrics.availconf.alert_state_audit` — журнал действий процессора.
-
-Ключевые поля `alert_state`:
-
-- `event_balance`
-- `status`
-- `last_event1_at`
-- `last_event0_at`
-- `flap_reopen_until`
-- `ktalk_thread_id`
-- `jira_issue_key`
-
----
-
-## 8. Интеграции
-
-## 8.1 Jira
-
-- `clients/jira_client.py` — HTTP-вызовы Jira.
-- `services/jira_service.py` — подготовка/интерпретация данных:
-  - получение сервисных атрибутов;
-  - создание инцидента;
-  - проверка статуса issue.
-
-### 8.2 KTalk
-
-- `clients/ktalk_client.py` — HTTP API KTalk.
-- `services/ktalk_service.py` — бизнес-функции:
-  - создание обсуждения (`event_id` первого сообщения используется как `thread_id`);
-  - отправка сообщений в thread;
-  - уведомление получателей и инвайт (если включено).
-
-### 8.3 AD / Recipients
-
-- `clients/ldap_client.py` — базовый LDAP-адаптер.
-- `services/recipient_service.py` — преобразование списка получателей в mention-id.
-
----
-
-## 9. Логирование
-
-`product/logging_setup.py` настраивает единый logger `autoalerter` с записью в файл из `cnf.LOG_FILE`.
-
-Рекомендуется подключать ротацию логов на уровне окружения (systemd/journald/logrotate).
-
----
-
-## 10. Примеры запуска
-
-### 10.1 Problem (`event=1`)
+## Пример запуска
 
 ```bash
 python main.py \
@@ -277,38 +140,3 @@ python main.py \
   --trigName "CPU load is high" \
   --message "Problem: CPU load is high"
 ```
-
-### 10.2 Recovery (`event=0`)
-
-```bash
-python main.py \
-  --event 0 \
-  --insightId TZ-12345 \
-  --groups "Linux,SG/TEST,..." \
-  --triggerTime "2026.04.13 23:05:00" \
-  --trigName "CPU load is high" \
-  --message "Recovery: CPU load is normal"
-```
-
----
-
-## 11. Проверка сценариев (чек-лист)
-
-При ручной/интеграционной проверке рекомендуется подтвердить:
-
-1. Днём `event=1` без active state → создаются новый Jira и новый thread.
-2. Повторный `event=1` при active state → запись в текущий thread, без новых внешних сущностей.
-3. `event=0` при active state → уменьшается баланс, обновляется `last_event0_at`.
-4. Ночью `event=1` в пределах 3 часов после `event=0` → reuse предыдущих Jira/thread.
-5. Ночью `event=1` позже 3 часов → создаются новые Jira/thread.
-6. Днём `event=1` после закрытия → стандартное создание новой сущности.
-7. `event=0` без active state → корректный ignore без падения.
-
----
-
-## 12. Примечания по эксплуатации
-
-- Перед запуском убедитесь, что в PostgreSQL существуют схемы/права для `trmetrics.availconf`.
-- Примените DDL из `product/db/schema.py` до старта процессора.
-- Для production лучше использовать отдельного DB-пользователя с минимально достаточными правами.
-- Для внешних API настройте доступность endpoint'ов и корректные токены в `cnf.py`.
