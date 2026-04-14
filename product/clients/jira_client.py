@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 import requests
 
 from product import cnf
@@ -15,16 +13,16 @@ class JiraClient:
             "Accept": "application/json",
         }
 
-    def get_object_attributes(self, object_id: str | int) -> list[dict[str, Any]]:
+    def get_service_attributes(self, object_id: str) -> dict:
+        url = cnf.JIRA_SERVICE_URL.format(object_id)
         response = requests.get(
-            cnf.JIRA_SERVICE_URL.format(object_id),
+            url,
             headers=self._headers,
             timeout=cnf.REQUEST_TIMEOUT,
             verify=cnf.VERIFY_SSL,
         )
         response.raise_for_status()
-        payload = response.json()
-        return payload if isinstance(payload, list) else []
+        return response.json()
 
     def create_incident(self, payload: dict) -> dict:
         response = requests.post(

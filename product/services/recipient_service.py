@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-from product.clients.ad_mapping_client import ADMappingClient
+from product.clients.ldap_client import LdapClient
 
 
 class RecipientService:
-    def __init__(self, ad_mapping_client: ADMappingClient) -> None:
-        self.ad_mapping_client = ad_mapping_client
-
-    def get_recipient_profiles(self, recipients: list[str]) -> dict[str, dict[str, str]]:
-        return self.ad_mapping_client.get_recipient_profiles_from_ad_mapping(recipients)
+    def __init__(self, ldap_client: LdapClient) -> None:
+        self.ldap_client = ldap_client
 
     def resolve_mentions(self, recipients: list[str]) -> list[str]:
-        profiles = self.get_recipient_profiles(recipients)
         mention_ids: list[str] = []
-        for login in self.ad_mapping_client.normalize_logins(recipients):
-            profile = profiles.get(login)
-            if profile and profile.get("mention_id") and profile["mention_id"] not in mention_ids:
+        for login in recipients:
+            profile = self.ldap_client.get_user_profile(login)
+            if profile and profile.get("mention_id"):
                 mention_ids.append(profile["mention_id"])
         return mention_ids

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 
 from product import cnf
-from product.clients.ad_mapping_client import ADMappingClient
 from product.clients.jira_client import JiraClient
 from product.clients.ktalk_client import KTalkClient
+from product.clients.ldap_client import LdapClient
 from product.db.repository import AlertStateRepository
 from product.models.events import EventPayload, ParsedEvent
 from product.services.flap_policy import should_reuse_night_incident
@@ -25,7 +24,7 @@ class EventProcessor:
         self.state_service = StateService(AlertStateRepository())
         self.jira_service = JiraService(JiraClient())
         self.ktalk_service = KTalkService(KTalkClient())
-        self.recipient_service = RecipientService(ADMappingClient())
+        self.recipient_service = RecipientService(LdapClient())
 
     def run_from_cli(self) -> int:
         parser = argparse.ArgumentParser()
@@ -76,23 +75,14 @@ class EventProcessor:
                 active_state.ktalk_room_id or cnf.KTALK_ROOM_ID,
                 active_state.ktalk_thread_id,
                 f"Повторный event=1: {event.message}",
-                event="1",
             )
-            self._append_audit(
-                active_state.id,
-                event,
-                "append_to_active_incident",
-                f"balance={updated['event_balance']}",
-                decision_code="append_to_active_incident",
-                jira_issue_key=active_state.jira_issue_key,
-                ktalk_thread_id=active_state.ktalk_thread_id,
-            )
+            self._append_audit(active_state.id, event, "active_increment", f"balance={updated['event_balance']}")
             return
 
         last_state = self.state_service.get_last_state(event.insight_id)
         night = is_night_window(event.trigger_time, cnf.FLAP_NIGHT_START_HOUR, cnf.FLAP_NIGHT_END_HOUR)
 
-        can_reuse = (
+        if (
             last_state is not None
             and should_reuse_night_incident(
                 now_dt=event.trigger_time,
@@ -102,64 +92,35 @@ class EventProcessor:
             )
             and last_state.ktalk_thread_id
             and last_state.jira_issue_key
-            and last_state.status in {"closed", "cooldown_night", "active"}
-        )
-        if can_reuse:
+        ):
             self.state_service.activate_existing_state(last_state.id, event.trigger_time)
             self.ktalk_service.send_thread_message(
                 last_state.ktalk_room_id or cnf.KTALK_ROOM_ID,
                 last_state.ktalk_thread_id,
-                f"Ночной re-open (<= {cnf.FLAP_REOPEN_HOURS}ч): {event.message}",
-                event="1",
+                f"Ночной re-open (<=3ч): {event.message}",
             )
-            self._append_audit(
-                last_state.id,
-                event,
-                "reopen_existing_night_incident",
-                "reuse previous jira/thread",
-                decision_code="reopen_existing_night_incident",
-                jira_issue_key=last_state.jira_issue_key,
-                ktalk_thread_id=last_state.ktalk_thread_id,
-            )
+            self._append_audit(last_state.id, event, "night_reuse", "reuse previous jira/thread")
             return
 
         service_data = self.jira_service.get_service_data(event.insight_id)
-        if not service_data.is_actual:
-            self._append_audit(
-                None,
-                event,
-                "skip_not_actual",
-                "service is not actual in Jira Assets",
-                decision_code="skip_not_actual",
-            )
+        if not service_data.get("is_actual", True):
+            self._append_audit(None, event, "skip_not_actual", "service is not actual in Jira Assets")
             return
 
-        short_name = extract_shortname(event.groups)
-        jira_key = self.jira_service.create_incident(
-            insight_id=event.insight_id,
-            short_name=short_name,
-            trigger_name=event.trigger_name,
-            event_message=event.message,
-            service_data=service_data,
-        )
-
-        mentions = self.recipient_service.resolve_mentions(service_data.recipients)
+        jira_key = self.jira_service.create_incident(service_data, event.message)
         room_id, thread_id = self.ktalk_service.create_discussion(
-            users=mentions,
-            full_name=service_data.full_name,
-            trigger_name=event.trigger_name,
-            reply=event.message,
-            jira_key=jira_key,
-            trigger_time=event.trigger_time.isoformat(),
+            f"Открыт инцидент {jira_key}: {event.message}", room_id=cnf.KTALK_ROOM_ID
         )
+        mentions = self.recipient_service.resolve_mentions(service_data.get("recipients", []))
+        self.ktalk_service.notify_recipients(room_id, mentions, f"Уведомление по {event.insight_id}")
 
         state_id = self.state_service.create_state(
             {
                 "insight_id": event.insight_id,
-                "short_name": short_name,
-                "full_name": service_data.full_name,
+                "short_name": extract_shortname(event.groups),
+                "full_name": service_data.get("full_name"),
                 "trigger_name": event.trigger_name,
-                "recipients": service_data.recipients,
+                "recipients": service_data.get("recipients", []),
                 "ktalk_room_id": room_id,
                 "ktalk_thread_id": thread_id,
                 "jira_issue_key": jira_key,
@@ -168,41 +129,12 @@ class EventProcessor:
                 "last_event1_at": event.trigger_time,
             }
         )
-        self.state_service.insert_incident_history(
-            {
-                "insight_id": event.insight_id,
-                "short_name": short_name,
-                "full_name": service_data.full_name,
-                "trigger_name": event.trigger_name,
-                "trigger_time": event.trigger_time,
-                "recipients": service_data.recipients,
-                "jira_issue_key": jira_key,
-                "ktalk_thread_id": thread_id,
-                "ktalk_room_id": room_id,
-            }
-        )
-
-        decision_code = "night_cooldown_expired_open_new" if night and last_state else "open_new_incident"
-        self._append_audit(
-            state_id,
-            event,
-            decision_code,
-            "created jira and thread",
-            decision_code=decision_code,
-            jira_issue_key=jira_key,
-            ktalk_thread_id=thread_id,
-        )
+        self._append_audit(state_id, event, "create_new", "created jira and thread")
 
     def _handle_event_close(self, event: ParsedEvent) -> None:
         active_state = self.state_service.get_active_state(event.insight_id)
         if active_state is None:
-            self._append_audit(
-                None,
-                event,
-                "close_event_ignored_no_state",
-                "no active state",
-                decision_code="close_event_ignored_no_state",
-            )
+            self._append_audit(None, event, "ignore_close_no_active", "no active state")
             return
 
         updated = self.state_service.decrease_event_balance(active_state.id, event.trigger_time)
@@ -210,87 +142,16 @@ class EventProcessor:
             active_state.ktalk_room_id or cnf.KTALK_ROOM_ID,
             active_state.ktalk_thread_id,
             f"event=0: {event.message}",
-            event="0",
-        )
-
-        night = is_night_window(
-            event.trigger_time,
-            cnf.FLAP_NIGHT_START_HOUR,
-            cnf.FLAP_NIGHT_END_HOUR,
         )
 
         if updated["event_balance"] > 0:
-            self._append_audit(
-                active_state.id,
-                event,
-                "close_event_decrement_only",
-                f"balance={updated['event_balance']}",
-                decision_code="close_event_decrement_only",
-                jira_issue_key=active_state.jira_issue_key,
-                ktalk_thread_id=active_state.ktalk_thread_id,
-            )
-            return
-
-        if night:
-            self.state_service.mark_state_cooldown_night(active_state.id)
-            self.ktalk_service.send_thread_message(
-                active_state.ktalk_room_id or cnf.KTALK_ROOM_ID,
-                active_state.ktalk_thread_id,
-                "Активные алерты временно отсутствуют. В ночной период в течение 3 часов повторное срабатывание будет продолжено в этом же обсуждении.",
-                event="0",
-            )
-            self._append_audit(
-                active_state.id,
-                event,
-                "night_cooldown_started",
-                "state moved to cooldown_night",
-                decision_code="night_cooldown_started",
-                jira_issue_key=active_state.jira_issue_key,
-                ktalk_thread_id=active_state.ktalk_thread_id,
-            )
+            self._append_audit(active_state.id, event, "decrease_only", f"balance={updated['event_balance']}")
             return
 
         self.state_service.mark_state_closed(active_state.id)
-        self.state_service.close_incident_history(
-            insight_id=event.insight_id,
-            jira_issue_key=active_state.jira_issue_key,
-            close_reason="daytime_close",
-        )
-        self.ktalk_service.send_thread_message(
-            active_state.ktalk_room_id or cnf.KTALK_ROOM_ID,
-            active_state.ktalk_thread_id,
-            "Активные алерты, на которые был создан инцидент, отсутствуют",
-            event="0",
-        )
-        self._append_audit(
-            active_state.id,
-            event,
-            "close_final_daytime",
-            "state marked closed",
-            decision_code="close_final_daytime",
-            jira_issue_key=active_state.jira_issue_key,
-            ktalk_thread_id=active_state.ktalk_thread_id,
-        )
+        self._append_audit(active_state.id, event, "close_state", "state marked closed")
 
-    def _append_audit(
-        self,
-        state_id: int | None,
-        event: ParsedEvent,
-        action: str,
-        note: str,
-        decision_code: str,
-        jira_issue_key: str | None = None,
-        ktalk_thread_id: str | None = None,
-    ) -> None:
-        payload_json = json.dumps(
-            {
-                "insight_id": event.insight_id,
-                "trigger_name": event.trigger_name,
-                "message": event.message,
-                "event_value": event.event_value,
-            },
-            ensure_ascii=False,
-        )
+    def _append_audit(self, state_id: int | None, event: ParsedEvent, action: str, note: str) -> None:
         self.state_service.append_audit_event(
             {
                 "alert_state_id": state_id,
@@ -299,10 +160,6 @@ class EventProcessor:
                 "event_time": event.trigger_time,
                 "action": action,
                 "note": note,
-                "decision_code": decision_code,
-                "jira_issue_key": jira_issue_key,
-                "ktalk_thread_id": ktalk_thread_id,
-                "payload_json": payload_json,
             }
         )
-        self.logger.info("audit decision=%s action=%s insight=%s", decision_code, action, event.insight_id)
+        self.logger.info("audit action=%s insight=%s note=%s", action, event.insight_id, note)
